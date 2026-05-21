@@ -31,6 +31,7 @@ export const App = () => {
   const [hintText, setHintText] = useState('');
   const [nameInput, setNameInput] = useState('');
   const [showQuitModal, setShowQuitModal] = useState(false);
+  const [inputError, setInputError] = useState(false);
 
   const countdownIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const phaseRef = useRef(phase);
@@ -85,6 +86,7 @@ export const App = () => {
     setFeedback('');
     setFeedbackType('');
     setCardState('');
+    setInputError(false);
     setHintText('Memorise this number…');
 
     const number = generateNumber(level + 2);
@@ -107,6 +109,19 @@ export const App = () => {
     if (phase !== 'input') return;
     const ans = userInput.trim();
     if (!ans) return;
+
+    // Validate input is numeric
+    if (!/^\d+$/.test(ans)) {
+      setInputError(true);
+      setFeedback('⚠️ Please enter only numbers');
+      setFeedbackType('bad');
+      setTimeout(() => {
+        setInputError(false);
+        setFeedback('');
+        setFeedbackType('');
+      }, 1500);
+      return;
+    }
 
     stopCountdown();
     setPhase('result');
@@ -198,7 +213,6 @@ export const App = () => {
   ];
   const maxBench = Math.max(...benchmarks.map((b) => b.val)) + 2;
 
-  const ringOffset = CIRC * (1 - timeLeft / INPUT_TIME);
   const ringColor = timeLeft <= 5 ? 'var(--red)' : 'var(--green)';
 
   return (
@@ -206,7 +220,7 @@ export const App = () => {
       style={{
         width: '100%',
         maxWidth: '440px',
-        padding: '1.5rem',
+        padding: '1rem',
         margin: '0 auto',
         minHeight: '100vh',
         display: 'flex',
@@ -524,9 +538,9 @@ export const App = () => {
               background: 'var(--surface)',
               border: `1px solid ${cardState === 'correct' ? 'rgba(0,229,160,0.4)' : cardState === 'wrong' ? 'rgba(255,78,106,0.4)' : 'var(--border)'}`,
               borderRadius: '16px',
-              padding: '2.5rem 1rem',
-              marginBottom: '1rem',
-              minHeight: '130px',
+              padding: '2rem 1rem',
+              marginBottom: '0.75rem',
+              minHeight: '120px',
               display: 'flex',
               alignItems: 'center',
               justifyContent: 'center',
@@ -556,8 +570,8 @@ export const App = () => {
             style={{
               fontSize: '13px',
               color: 'var(--muted)',
-              marginBottom: '1rem',
-              minHeight: '20px',
+              marginBottom: '0.75rem',
+              minHeight: '18px',
             }}
           >
             {hintText}
@@ -569,7 +583,7 @@ export const App = () => {
               background: 'var(--surface2)',
               borderRadius: '2px',
               overflow: 'hidden',
-              marginBottom: '1.5rem',
+              marginBottom: '1rem',
             }}
           >
             <div
@@ -585,93 +599,116 @@ export const App = () => {
 
           {phase === 'input' && (
             <div>
-              <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '12px' }}>
-                <div style={{ position: 'relative', width: '52px', height: '52px', flexShrink: 0 }}>
-                  <svg
-                    width="52"
-                    height="52"
-                    viewBox="0 0 52 52"
-                    style={{ transform: 'rotate(-90deg)' }}
-                  >
-                    <circle
-                      cx="26"
-                      cy="26"
-                      r="22"
-                      fill="none"
-                      stroke="var(--surface2)"
-                      strokeWidth="4"
-                    />
-                    <circle
-                      cx="26"
-                      cy="26"
-                      r="22"
-                      fill="none"
-                      stroke={ringColor}
-                      strokeWidth="4"
-                      strokeLinecap="round"
-                      strokeDasharray={CIRC}
-                      strokeDashoffset={ringOffset}
-                      style={{ transition: 'stroke 0.5s' }}
-                    />
-                  </svg>
-                  <div
-                    style={{
-                      position: 'absolute',
-                      inset: 0,
-                      display: 'flex',
-                      alignItems: 'center',
-                      justifyContent: 'center',
-                      fontFamily: 'var(--mono)',
-                      fontSize: '16px',
-                      fontWeight: 500,
-                      color: 'var(--text)',
-                    }}
-                  >
-                    {timeLeft}
-                  </div>
-                </div>
-                <div style={{ display: 'flex', gap: '8px', flex: 1 }}>
-                  <input
-                    type="text"
-                    inputMode="numeric"
-                    maxLength={22}
-                    placeholder="type the number…"
-                    autoComplete="off"
-                    value={userInput}
-                    onChange={(e) => setUserInput(e.target.value)}
-                    onKeyDown={(e) => {
-                      if (e.key === 'Enter') checkAnswer();
-                    }}
-                    autoFocus
-                    style={{
-                      flex: 1,
-                      padding: '13px 16px',
-                      fontSize: '22px',
-                      fontFamily: 'var(--mono)',
-                      letterSpacing: '0.12em',
-                      textAlign: 'center',
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '10px', marginBottom: '8px' }}>
+                <input
+                  type="text"
+                  inputMode="numeric"
+                  maxLength={22}
+                  placeholder="type the number…"
+                  autoComplete="off"
+                  value={userInput}
+                  onChange={(e) => {
+                    const val = e.target.value;
+                    // Only allow numeric input
+                    if (val === '' || /^\d+$/.test(val)) {
+                      setUserInput(val);
+                      setInputError(false);
+                      if (feedback && feedbackType === 'bad' && feedback.includes('only numbers')) {
+                        setFeedback('');
+                        setFeedbackType('');
+                      }
+                    } else {
+                      setInputError(true);
+                      setFeedback('⚠️ Only numbers allowed');
+                      setFeedbackType('bad');
+                    }
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') checkAnswer();
+                  }}
+                  autoFocus
+                  style={{
+                    width: '100%',
+                    padding: '16px',
+                    fontSize: '24px',
+                    fontFamily: 'var(--mono)',
+                    letterSpacing: '0.15em',
+                    textAlign: 'center',
+                    background: 'var(--surface)',
+                    border: `2px solid ${inputError ? 'var(--red)' : 'var(--border-strong)'}`,
+                    borderRadius: '12px',
+                    color: 'var(--text)',
+                    outline: 'none',
+                    transition: 'border-color 0.2s',
+                  }}
+                />
+                <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                  <div 
+                    style={{ 
+                      display: 'flex', 
+                      alignItems: 'center', 
+                      gap: '8px',
+                      padding: '8px 12px',
                       background: 'var(--surface)',
-                      border: '1px solid var(--border-strong)',
-                      borderRadius: '10px',
-                      color: 'var(--text)',
-                      outline: 'none',
+                      border: '1px solid var(--border)',
+                      borderRadius: '8px',
+                      flexShrink: 0,
                     }}
-                  />
+                  >
+                    <svg width="20" height="20" viewBox="0 0 20 20" style={{ transform: 'rotate(-90deg)' }}>
+                      <circle
+                        cx="10"
+                        cy="10"
+                        r="8"
+                        fill="none"
+                        stroke="var(--surface2)"
+                        strokeWidth="2"
+                      />
+                      <circle
+                        cx="10"
+                        cy="10"
+                        r="8"
+                        fill="none"
+                        stroke={ringColor}
+                        strokeWidth="2"
+                        strokeLinecap="round"
+                        strokeDasharray="50.27"
+                        strokeDashoffset={50.27 * (1 - timeLeft / INPUT_TIME)}
+                        style={{ transition: 'stroke 0.5s' }}
+                      />
+                    </svg>
+                    <span
+                      style={{
+                        fontFamily: 'var(--mono)',
+                        fontSize: '15px',
+                        fontWeight: 600,
+                        color: timeLeft <= 5 ? 'var(--red)' : 'var(--text)',
+                        minWidth: '20px',
+                        textAlign: 'center',
+                      }}
+                    >
+                      {timeLeft}s
+                    </span>
+                  </div>
                   <button
                     onClick={checkAnswer}
+                    disabled={!userInput.trim()}
                     style={{
-                      padding: '13px 20px',
-                      fontSize: '15px',
+                      flex: 1,
+                      padding: '14px 20px',
+                      fontSize: '16px',
                       fontWeight: 600,
                       fontFamily: 'var(--sans)',
-                      background: 'var(--green)',
-                      color: '#050f0a',
+                      background: userInput.trim() ? 'var(--green)' : 'var(--surface2)',
+                      color: userInput.trim() ? '#050f0a' : 'var(--muted)',
                       border: 'none',
                       borderRadius: '10px',
-                      cursor: 'pointer',
+                      cursor: userInput.trim() ? 'pointer' : 'not-allowed',
+                      transition: 'all 0.2s',
+                      opacity: userInput.trim() ? 1 : 0.5,
                     }}
                   >
-                    Go
+                    Submit
                   </button>
                 </div>
               </div>
