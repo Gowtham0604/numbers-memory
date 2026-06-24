@@ -1,12 +1,35 @@
 import './index.css';
 
-import { StrictMode, useState, useEffect, useRef } from 'react';
+import { StrictMode, useState, useEffect, useRef, useCallback } from 'react';
 import { createRoot } from 'react-dom/client';
+import { fetchGameInit, fetchLeaderboard, submitGameScore } from './lib/game-api';
+import { generateSeededNumber } from '../shared/game';
+import type { GameInitData, SubmitScoreData } from '../shared/api';
+import type { LeaderboardEntry } from '../shared/game';
 
-type GamePhase = 'howto' | 'name' | 'showing' | 'input' | 'result';
+type GamePhase = 'tutorial' | 'showing' | 'input' | 'result' | 'gameover';
+type TutorialStep = 'intro' | 'watch' | 'type' | 'done';
 
-const INPUT_TIME = 15;
-const CIRC = 138;
+const BASE_INPUT_TIME = 10;
+const EXTENDED_INPUT_TIME = 12;
+const EXTENDED_LEVEL_THRESHOLD = 10; // level 10+ gets more time
+const TUTORIAL_NUMBER = '4823';
+const HAS_PLAYED_KEY = 'nmg_has_played';
+
+// Scale font size down for long numbers so they don't overflow
+const numberFontSize = (len: number): string => {
+  if (len <= 5) return '48px';
+  if (len <= 8) return '36px';
+  if (len <= 11) return '28px';
+  return '22px';
+};
+
+// Break long numbers into groups for readability
+const formatNumber = (num: string): string => {
+  if (num.length <= 5) return num;
+  // groups of 3 separated by thin space
+  return num.replace(/(\d)(?=(\d{3})+(?!\d))/g, '$1 ');
+};
 
 const generateNumber = (length: number): string => {
   let result = '';
@@ -17,28 +40,65 @@ const generateNumber = (length: number): string => {
 };
 
 export const App = () => {
-  const [phase, setPhase] = useState<GamePhase>('howto');
+  const hasPlayed = typeof localStorage !== 'undefined' && localStorage.getItem(HAS_PLAYED_KEY) === '1';
+
+  const [phase, setPhase] = useState<GamePhase>(hasPlayed ? 'showing' : 'tutorial');
   const [level, setLevel] = useState(1);
   const [lives, setLives] = useState(3);
-  const [playerName, setPlayerName] = useState('');
   const [currentNumber, setCurrentNumber] = useState('');
   const [userInput, setUserInput] = useState('');
-  const [timeLeft, setTimeLeft] = useState(INPUT_TIME);
+  const [timeLeft, setTimeLeft] = useState(BASE_INPUT_TIME);
+  const [maxTime, setMaxTime] = useState(BASE_INPUT_TIME);
   const [feedback, setFeedback] = useState('');
   const [feedbackType, setFeedbackType] = useState<'ok' | 'bad' | ''>('');
   const [cardState, setCardState] = useState<'correct' | 'wrong' | ''>('');
   const [showNumber, setShowNumber] = useState(false);
   const [hintText, setHintText] = useState('');
-  const [nameInput, setNameInput] = useState('');
   const [showQuitModal, setShowQuitModal] = useState(false);
   const [inputError, setInputError] = useState(false);
+  const [shakeCard, setShakeCard] = useState(false);
+  const [showWrongBanner, setShowWrongBanner] = useState(false);
+  const [showCorrectBanner, setShowCorrectBanner] = useState(false);
+
+  // Tutorial state
+  const [tutorialStep, setTutorialStep] = useState<TutorialStep>('intro');
+  const [tutorialShowNumber, setTutorialShowNumber] = useState(false);
+  const [tutorialInput, setTutorialInput] = useState('');
+  const [tutorialFeedback, setTutorialFeedback] = useState('');
+  const [tutorialFeedbackType, setTutorialFeedbackType] = useState<'ok' | 'bad' | ''>('');
+  const [tutorialInputError, setTutorialInputError] = useState(false);
+
+  const [gameInit, setGameInit] = useState<GameInitData | null>(null);
+  const [submitResult, setSubmitResult] = useState<SubmitScoreData | null>(null);
+  const [leaderboard, setLeaderboard] = useState<LeaderboardEntry[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [scoreSubmitted, setScoreSubmitted] = useState(false);
 
   const countdownIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const phaseRef = useRef(phase);
+  const gameInitRef = useRef(gameInit);
+
+  useEffect(() => {
+    gameInitRef.current = gameInit;
+  }, [gameInit]);
+
+  useEffect(() => {
+    void fetchGameInit()
+      .then((res) => {
+        if (res.status === 'success') setGameInit(res.data);
+      })
+      .finally(() => setLoading(false));
+  }, []);
 
   useEffect(() => {
     phaseRef.current = phase;
   }, [phase]);
+
+  const triggerWrongFeedback = () => {
+    setShakeCard(true);
+    setShowWrongBanner(true);
+    setTimeout(() => setShakeCard(false), 600);
+  };
 
   const stopCountdown = () => {
     if (countdownIntervalRef.current) {
@@ -47,8 +107,13 @@ export const App = () => {
     }
   };
 
-  const startCountdown = () => {
-    setTimeLeft(INPUT_TIME);
+  const startCountdown = (currentLevel = 1) => {
+    const challenge = gameInitRef.current?.dailyChallenge;
+    const bonus = challenge?.inputTimeBonus ?? 0;
+    const baseTime = currentLevel >= EXTENDED_LEVEL_THRESHOLD ? EXTENDED_INPUT_TIME : BASE_INPUT_TIME;
+    const inputTime = Math.max(5, baseTime + bonus);
+    setMaxTime(inputTime);
+    setTimeLeft(inputTime);
     countdownIntervalRef.current = setInterval(() => {
       setTimeLeft((prev) => {
         if (prev <= 1) {
@@ -71,6 +136,7 @@ export const App = () => {
     setHintText('');
     const newLives = lives - 1;
     setLives(newLives);
+    triggerWrongFeedback();
 
     if (newLives <= 0) {
       setTimeout(() => showResult(), 1100);
@@ -87,30 +153,47 @@ export const App = () => {
     setFeedbackType('');
     setCardState('');
     setInputError(false);
+    setShakeCard(false);
+    setShowWrongBanner(false);
+    setShowCorrectBanner(false);
     setHintText('Memorise this number…');
 
-    const number = generateNumber(level + 2);
+    const numberLength = level + 2;
+    const init = gameInitRef.current;
+    const number =
+      init?.isDailyChallenge && init.dailyChallenge && !init.isExpired
+        ? generateSeededNumber(init.dailyChallenge.seed, level, numberLength)
+        : generateNumber(numberLength);
     setCurrentNumber(number);
     setShowNumber(true);
 
-    const duration = Math.max(1200, number.length * 480);
+    const baseDuration = Math.max(1200, number.length * 480);
+    const multiplier = init?.dailyChallenge?.displayTimeMultiplier ?? 1;
+    const duration = baseDuration * multiplier;
 
     setTimeout(() => {
       setShowNumber(false);
       setTimeout(() => {
         setPhase('input');
         setHintText('Now type what you saw');
-        startCountdown();
+        startCountdown(level);
       }, 250);
     }, duration);
   };
+
+  // Auto-start game if returning user
+  useEffect(() => {
+    if (hasPlayed && phase === 'showing') {
+      startRound();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const checkAnswer = () => {
     if (phase !== 'input') return;
     const ans = userInput.trim();
     if (!ans) return;
 
-    // Validate input is numeric
     if (!/^\d+$/.test(ans)) {
       setInputError(true);
       setFeedback('⚠️ Please enter only numbers');
@@ -131,8 +214,9 @@ export const App = () => {
       setFeedback('✓ Correct!');
       setFeedbackType('ok');
       setHintText('');
+      setShowCorrectBanner(true);
       setLevel((prev) => prev + 1);
-      setTimeout(() => startRound(), 900);
+      setTimeout(() => startRound(), 1600);
     } else {
       setCardState('wrong');
       setFeedback(`✗ It was ${currentNumber}`);
@@ -140,6 +224,7 @@ export const App = () => {
       setHintText('');
       const newLives = lives - 1;
       setLives(newLives);
+      triggerWrongFeedback();
 
       if (newLives <= 0) {
         setTimeout(() => showResult(), 1100);
@@ -149,23 +234,31 @@ export const App = () => {
     }
   };
 
+  const recordScore = useCallback(async (finalLevel: number) => {
+    const score = finalLevel - 1;
+    if (score <= 0 || scoreSubmitted) return;
+
+    setScoreSubmitted(true);
+    try {
+      const [scoreRes, lbRes] = await Promise.all([
+        submitGameScore(score),
+        fetchLeaderboard(10),
+      ]);
+      if (scoreRes.status === 'success') setSubmitResult(scoreRes.data);
+      if (lbRes.status === 'success') setLeaderboard(lbRes.data.entries);
+    } catch {
+      // Score submission is best-effort; game over UI still shows local result
+    }
+  }, [scoreSubmitted]);
+
   const showResult = () => {
     stopCountdown();
-    setPhase('result');
-  };
-
-  const startGame = () => {
-    const name = nameInput.trim() || 'Player';
-    setPlayerName(name);
-    initPlay();
-  };
-
-  const startGameAnon = () => {
-    setPlayerName('');
-    initPlay();
+    setPhase('gameover');
+    void recordScore(level);
   };
 
   const initPlay = () => {
+    localStorage.setItem(HAS_PLAYED_KEY, '1');
     setLevel(1);
     setLives(3);
     setPhase('showing');
@@ -175,6 +268,9 @@ export const App = () => {
   const restartGame = () => {
     setLevel(1);
     setLives(3);
+    setSubmitResult(null);
+    setLeaderboard([]);
+    setScoreSubmitted(false);
     setPhase('showing');
     setTimeout(() => startRound(), 100);
   };
@@ -192,28 +288,127 @@ export const App = () => {
   const closeQuitModal = () => {
     setShowQuitModal(false);
     setPhase('input');
-    startCountdown();
+    startCountdown(level);
   };
 
-  const digits = level + 2;
-  const emoji = digits >= 10 ? '🏆' : digits >= 8 ? '🌟' : digits >= 6 ? '🧠' : '💪';
+  // Tutorial helpers
+  const runTutorialDemo = () => {
+    setTutorialStep('watch');
+    setTutorialShowNumber(false);
+    setTutorialInput('');
+    setTutorialFeedback('');
+    setTutorialFeedbackType('');
+
+    setTimeout(() => {
+      setTutorialShowNumber(true);
+      setTimeout(() => {
+        setTutorialShowNumber(false);
+        setTimeout(() => {
+          setTutorialStep('type');
+        }, 300);
+      }, 2400);
+    }, 400);
+  };
+
+  const checkTutorialAnswer = () => {
+    const ans = tutorialInput.trim();
+    if (!ans) return;
+
+    if (!/^\d+$/.test(ans)) {
+      setTutorialInputError(true);
+      setTutorialFeedback('⚠️ Only numbers allowed');
+      setTutorialFeedbackType('bad');
+      return;
+    }
+
+    if (ans === TUTORIAL_NUMBER) {
+      setTutorialFeedback('✓ Perfect! You got it!');
+      setTutorialFeedbackType('ok');
+      setTimeout(() => setTutorialStep('done'), 900);
+    } else {
+      setTutorialFeedback(`✗ It was ${TUTORIAL_NUMBER} — try the real game!`);
+      setTutorialFeedbackType('bad');
+      setTimeout(() => setTutorialStep('done'), 1200);
+    }
+  };
+
+  const levelsCompleted = level - 1;
+  const emoji =
+    levelsCompleted >= 15
+      ? '🏆'
+      : levelsCompleted >= 10
+        ? '🌟'
+        : levelsCompleted >= 5
+          ? '🧠'
+          : levelsCompleted > 0
+            ? '💪'
+            : '😴';
   const tag =
-    digits >= 10
-      ? '🏆 Top 1% memory!'
-      : digits >= 8
-        ? '⭐ Above average!'
-        : digits >= 7
-          ? '✓ Right at average'
-          : "Keep training — you'll improve!";
+    levelsCompleted >= 15
+      ? '🏆 Memory master!'
+      : levelsCompleted >= 10
+        ? '⭐ Impressive run!'
+        : levelsCompleted >= 5
+          ? '✓ Solid performance!'
+          : levelsCompleted > 0
+            ? "Keep training — you'll improve!"
+            : 'No levels completed — try again!';
 
-  const benchmarks = [
-    { label: 'Average', val: 7, color: '#888' },
-    { label: 'You', val: digits, color: 'var(--green)' },
-    { label: 'Expert', val: 10, color: 'var(--amber)' },
-  ];
-  const maxBench = Math.max(...benchmarks.map((b) => b.val)) + 2;
-
+  const MILESTONES = [1, 3, 5, 8, 10, 15];
   const ringColor = timeLeft <= 5 ? 'var(--red)' : 'var(--green)';
+
+  if (loading) {
+    return (
+      <div style={{ width: '100%', maxWidth: '440px', padding: '1rem', margin: '0 auto', minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+        <div style={{ color: 'var(--muted)', fontSize: '14px' }}>Loading…</div>
+      </div>
+    );
+  }
+
+  if (gameInit?.isDailyChallenge && gameInit.isExpired) {
+    return (
+      <div style={{ width: '100%', maxWidth: '440px', padding: '1rem', margin: '0 auto', minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+        <div style={{ textAlign: 'center', width: '100%' }}>
+          <div style={{ fontSize: '40px', marginBottom: '12px' }}>⏰</div>
+          <div style={{ fontSize: '22px', fontWeight: 700, marginBottom: '8px' }}>Challenge ended</div>
+          <div style={{ color: 'var(--muted)', fontSize: '14px', marginBottom: '8px', lineHeight: 1.6 }}>
+            This daily challenge has expired.
+          </div>
+          <div style={{ color: 'var(--muted)', fontSize: '13px', marginBottom: '1.5rem' }}>
+            {gameInit.playerCount} players competed today
+          </div>
+          <div style={{ fontSize: '13px', color: 'var(--green)' }}>
+            Find today's challenge in the subreddit feed →
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  const progressionBar = gameInit && gameInit.xp > 0 ? (
+    <div style={{ marginBottom: '1rem' }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '11px', color: 'var(--muted)', marginBottom: '4px' }}>
+        <span>Level {gameInit.level}</span>
+        {gameInit.streak.current > 0 && <span>🔥 {gameInit.streak.current} day streak</span>}
+        <span>{gameInit.levelProgress.current}/{gameInit.levelProgress.required} XP</span>
+      </div>
+      <div style={{ height: '4px', background: 'var(--surface2)', borderRadius: '2px', overflow: 'hidden' }}>
+        <div style={{ height: '100%', width: `${gameInit.levelProgress.percent}%`, background: 'var(--green)', borderRadius: '2px', transition: 'width 0.5s' }} />
+      </div>
+    </div>
+  ) : null;
+
+  const dailyBanner = gameInit?.isDailyChallenge && gameInit.dailyChallenge ? (
+    <div style={{ background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: '10px', padding: '10px 14px', marginBottom: '1rem', fontSize: '12px' }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+        <span style={{ color: 'var(--green)', fontWeight: 600 }}>Daily #{gameInit.dailyChallenge.dayNumber}</span>
+        <span style={{ color: 'var(--muted)', textTransform: 'capitalize' }}>{gameInit.dailyChallenge.difficulty}</span>
+      </div>
+      <div style={{ color: 'var(--muted)', marginTop: '4px' }}>
+        ⏰ {gameInit.expiresIn.hours}h {gameInit.expiresIn.minutes}m left · {gameInit.playerCount} playing today
+      </div>
+    </div>
+  ) : null;
 
   return (
     <div
@@ -228,259 +423,286 @@ export const App = () => {
         justifyContent: 'center',
       }}
     >
-      {/* HOW TO PLAY SCREEN */}
-      {phase === 'howto' && (
+      {/* ── TUTORIAL SCREEN (first-time only) ── */}
+      {phase === 'tutorial' && (
         <div style={{ textAlign: 'center', width: '100%' }}>
+          {/* Header */}
           <div
             style={{
               fontSize: '13px',
               letterSpacing: '0.2em',
               textTransform: 'uppercase',
               color: 'var(--green)',
-              marginBottom: '2.5rem',
+              marginBottom: '0.5rem',
               fontWeight: 600,
             }}
           >
             Number Memory
           </div>
-          <div style={{ fontSize: '28px', fontWeight: 600, marginBottom: '8px' }}>
-            How good is your memory?
-          </div>
-          <div
-            style={{
-              color: 'var(--muted)',
-              fontSize: '15px',
-              marginBottom: '2.5rem',
-              lineHeight: 1.6,
-            }}
-          >
-            A number flashes on screen.
-            <br />
-            Remember it. Type it back. Beat your record.
-          </div>
-          <div
-            style={{
-              display: 'flex',
-              flexDirection: 'column',
-              gap: '12px',
-              textAlign: 'left',
-              marginBottom: '2.5rem',
-            }}
-          >
-            {[
-              {
-                num: '1',
-                text: (
-                  <>
-                    <strong>Watch the number</strong> — a sequence of digits appears briefly,
-                    then disappears.
-                  </>
-                ),
-              },
-              {
-                num: '2',
-                text: (
-                  <>
-                    <strong>Type it back</strong> — you have 15 seconds to enter what you saw.
-                  </>
-                ),
-              },
-              {
-                num: '3',
-                text: (
-                  <>
-                    <strong>Each round gets harder</strong> — one more digit is added every time
-                    you get it right.
-                  </>
-                ),
-              },
-              {
-                num: '4',
-                text: (
-                  <>
-                    <strong>You have 3 lives</strong> — wrong answer or time's up costs one life.
-                    Game ends at zero.
-                  </>
-                ),
-              },
-            ].map((step) => (
+
+          {/* INTRO step */}
+          {tutorialStep === 'intro' && (
+            <>
+              <div style={{ fontSize: '26px', fontWeight: 700, marginBottom: '8px' }}>
+                How it works
+              </div>
+              <div style={{ color: 'var(--muted)', fontSize: '14px', marginBottom: '2rem', lineHeight: 1.6 }}>
+                We'll walk you through a quick demo so you know what to expect.
+              </div>
+
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '10px', marginBottom: '2rem', textAlign: 'left' }}>
+                {[
+                  { icon: '👁', label: 'A number flashes on screen for a few seconds' },
+                  { icon: '🧠', label: 'It disappears — hold it in your memory' },
+                  { icon: '⌨️', label: 'Type it back before time runs out' },
+                  { icon: '📈', label: 'Each correct answer adds one more digit' },
+                  { icon: '❤️', label: 'You have 3 lives — wrong or timeout costs one' },
+                ].map((item) => (
+                  <div
+                    key={item.icon}
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: '14px',
+                      background: 'var(--surface)',
+                      border: '1px solid var(--border)',
+                      borderRadius: '12px',
+                      padding: '12px 16px',
+                    }}
+                  >
+                    <span style={{ fontSize: '20px', flexShrink: 0 }}>{item.icon}</span>
+                    <span style={{ fontSize: '14px', color: 'var(--muted)', lineHeight: 1.5 }}>{item.label}</span>
+                  </div>
+                ))}
+              </div>
+
+              <button
+                className="btn btn-primary"
+                style={{ width: '100%', padding: '16px', fontSize: '16px' }}
+                onClick={runTutorialDemo}
+              >
+                See a demo →
+              </button>
+            </>
+          )}
+
+          {/* WATCH step — number is shown/hidden */}
+          {tutorialStep === 'watch' && (
+            <>
+              <div style={{ fontSize: '20px', fontWeight: 600, marginBottom: '6px' }}>
+                Watch the number
+              </div>
+              <div style={{ color: 'var(--muted)', fontSize: '13px', marginBottom: '1.5rem' }}>
+                Memorise it before it disappears…
+              </div>
+
               <div
-                key={step.num}
                 style={{
-                  display: 'flex',
-                  alignItems: 'flex-start',
-                  gap: '14px',
                   background: 'var(--surface)',
                   border: '1px solid var(--border)',
-                  borderRadius: '12px',
-                  padding: '14px 16px',
+                  borderRadius: '16px',
+                  padding: '2.5rem 1rem',
+                  marginBottom: '1rem',
+                  minHeight: '120px',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
                 }}
               >
                 <div
                   style={{
-                    width: '28px',
-                    height: '28px',
-                    borderRadius: '50%',
-                    background: 'var(--green-dim)',
-                    border: '1px solid rgba(0,229,160,0.3)',
-                    color: 'var(--green)',
-                    fontSize: '13px',
-                    fontWeight: 600,
-                    display: 'flex',
-                    alignItems: 'center',
-                    justifyContent: 'center',
-                    flexShrink: 0,
-                    marginTop: '1px',
+                    fontFamily: 'var(--mono)',
+                    fontSize: '52px',
+                    letterSpacing: '0.2em',
+                    opacity: tutorialShowNumber ? 1 : 0,
+                    transition: 'opacity 0.3s',
+                    color: 'var(--text)',
                   }}
                 >
-                  {step.num}
-                </div>
-                <div
-                  style={{
-                    fontSize: '14px',
-                    lineHeight: 1.6,
-                    color: 'var(--muted)',
-                  }}
-                >
-                  {step.text}
+                  {TUTORIAL_NUMBER}
                 </div>
               </div>
-            ))}
-          </div>
-          <div style={{ fontSize: '13px', color: 'var(--muted)', marginBottom: '1rem' }}>
-            Your 3 lives
-          </div>
-          <div
-            style={{
-              display: 'flex',
-              gap: '8px',
-              justifyContent: 'center',
-              marginBottom: '2.5rem',
-            }}
-          >
-            {[0, 1, 2].map((i) => (
+
+              <div style={{ fontSize: '13px', color: 'var(--muted)' }}>
+                {tutorialShowNumber ? '👁 Look at it carefully…' : '⏳ Getting ready…'}
+              </div>
+            </>
+          )}
+
+          {/* TYPE step */}
+          {tutorialStep === 'type' && (
+            <>
+              <div style={{ fontSize: '20px', fontWeight: 600, marginBottom: '6px' }}>
+                Now type it back
+              </div>
+              <div style={{ color: 'var(--muted)', fontSize: '13px', marginBottom: '1.5rem' }}>
+                What was the number?
+              </div>
+
               <div
-                key={i}
                 style={{
-                  width: '12px',
-                  height: '12px',
-                  borderRadius: '50%',
-                  background: 'var(--green)',
-                  boxShadow: '0 0 8px var(--green)',
+                  background: 'var(--surface)',
+                  border: '1px solid var(--border)',
+                  borderRadius: '16px',
+                  padding: '2.5rem 1rem',
+                  marginBottom: '1rem',
+                  minHeight: '120px',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                }}
+              >
+                <div
+                  style={{
+                    fontFamily: 'var(--mono)',
+                    fontSize: '52px',
+                    letterSpacing: '0.2em',
+                    color: 'var(--muted)',
+                    opacity: 0.25,
+                  }}
+                >
+                  ????
+                </div>
+              </div>
+
+              <input
+                type="text"
+                inputMode="numeric"
+                maxLength={8}
+                placeholder="type the number…"
+                autoComplete="off"
+                autoFocus
+                value={tutorialInput}
+                onChange={(e) => {
+                  const val = e.target.value;
+                  if (val === '' || /^\d+$/.test(val)) {
+                    setTutorialInput(val);
+                    setTutorialInputError(false);
+                    setTutorialFeedback('');
+                    setTutorialFeedbackType('');
+                  } else {
+                    setTutorialInputError(true);
+                    setTutorialFeedback('⚠️ Only numbers allowed');
+                    setTutorialFeedbackType('bad');
+                  }
+                }}
+                onKeyDown={(e) => { if (e.key === 'Enter') checkTutorialAnswer(); }}
+                style={{
+                  width: '100%',
+                  padding: '16px',
+                  fontSize: '24px',
+                  fontFamily: 'var(--mono)',
+                  letterSpacing: '0.15em',
+                  textAlign: 'center',
+                  background: 'var(--surface)',
+                  border: `2px solid ${tutorialInputError ? 'var(--red)' : 'var(--border-strong)'}`,
+                  borderRadius: '12px',
+                  color: 'var(--text)',
+                  outline: 'none',
+                  marginBottom: '10px',
+                  boxSizing: 'border-box',
                 }}
               />
-            ))}
-          </div>
-          <button
-            style={{
-              width: '100%',
-              padding: '14px',
-              fontSize: '15px',
-              fontWeight: 600,
-              fontFamily: 'var(--sans)',
-              background: 'var(--green)',
-              color: '#050f0a',
-              border: 'none',
-              borderRadius: '10px',
-              cursor: 'pointer',
-              letterSpacing: '0.02em',
-            }}
-            onClick={() => setPhase('name')}
-          >
-            Got it — let's play →
-          </button>
+
+              <div
+                style={{
+                  fontSize: '14px',
+                  minHeight: '22px',
+                  marginBottom: '10px',
+                  color: tutorialFeedbackType === 'ok' ? 'var(--green)' : tutorialFeedbackType === 'bad' ? 'var(--red)' : 'inherit',
+                }}
+              >
+                {tutorialFeedback}
+              </div>
+
+              <button
+                className="btn btn-primary"
+                style={{ width: '100%', padding: '14px', fontSize: '16px' }}
+                onClick={checkTutorialAnswer}
+                disabled={!tutorialInput.trim()}
+              >
+                Submit
+              </button>
+
+              <button
+                style={{
+                  background: 'none',
+                  border: 'none',
+                  color: 'var(--muted)',
+                  fontSize: '13px',
+                  marginTop: '14px',
+                  cursor: 'pointer',
+                  textDecoration: 'underline',
+                }}
+                onClick={() => setTutorialStep('done')}
+              >
+                Skip demo
+              </button>
+            </>
+          )}
+
+          {/* DONE step */}
+          {tutorialStep === 'done' && (
+            <>
+              <div style={{ fontSize: '32px', marginBottom: '12px' }}>🧠</div>
+              <div style={{ fontSize: '22px', fontWeight: 700, marginBottom: '8px' }}>
+                You're ready!
+              </div>
+              <div style={{ color: 'var(--muted)', fontSize: '14px', marginBottom: '2rem', lineHeight: 1.6 }}>
+                Numbers get longer as you level up. Stay focused and beat your record.
+              </div>
+
+              <div
+                style={{
+                  display: 'flex',
+                  gap: '8px',
+                  justifyContent: 'center',
+                  marginBottom: '2rem',
+                }}
+              >
+                {[0, 1, 2].map((i) => (
+                  <div
+                    key={i}
+                    style={{
+                      display: 'flex',
+                      flexDirection: 'column',
+                      alignItems: 'center',
+                      gap: '6px',
+                    }}
+                  >
+                    <div
+                      style={{
+                        width: '14px',
+                        height: '14px',
+                        borderRadius: '50%',
+                        background: 'var(--green)',
+                        boxShadow: '0 0 8px var(--green)',
+                      }}
+                    />
+                  </div>
+                ))}
+              </div>
+              <div style={{ fontSize: '12px', color: 'var(--muted)', marginBottom: '2rem' }}>
+                Your 3 lives
+              </div>
+
+              <button
+                className="btn btn-primary"
+                style={{ width: '100%', padding: '16px', fontSize: '16px', letterSpacing: '0.02em' }}
+                onClick={initPlay}
+              >
+                Start game →
+              </button>
+            </>
+          )}
         </div>
       )}
 
-      {/* NAME ENTRY SCREEN */}
-      {phase === 'name' && (
+      {/* ── PLAY SCREEN ── */}
+      {(phase === 'showing' || phase === 'input' || phase === 'result') && (
         <div style={{ textAlign: 'center', width: '100%' }}>
-          <div style={{ marginBottom: '2rem' }}>
-            <div
-              style={{
-                fontSize: '13px',
-                letterSpacing: '0.2em',
-                textTransform: 'uppercase',
-                color: 'var(--green)',
-                marginBottom: '2.5rem',
-                fontWeight: 600,
-              }}
-            >
-              Number Memory
-            </div>
-            <div style={{ fontSize: '24px', fontWeight: 600, marginBottom: '8px' }}>
-              What's your name?
-            </div>
-            <div style={{ color: 'var(--muted)', fontSize: '14px', marginBottom: '2rem' }}>
-              We'll show it on your score card.
-            </div>
-          </div>
-          <div style={{ position: 'relative', marginBottom: '1rem' }}>
-            <input
-              type="text"
-              placeholder="Enter your name"
-              maxLength={24}
-              autoComplete="off"
-              value={nameInput}
-              onChange={(e) => setNameInput(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter') startGame();
-              }}
-              style={{
-                width: '100%',
-                padding: '14px 18px',
-                fontSize: '16px',
-                fontFamily: 'var(--sans)',
-                background: 'var(--surface)',
-                border: '1px solid var(--border-strong)',
-                borderRadius: '10px',
-                color: 'var(--text)',
-                outline: 'none',
-              }}
-            />
-          </div>
-          <button
-            style={{
-              width: '100%',
-              padding: '14px',
-              fontSize: '15px',
-              fontWeight: 600,
-              fontFamily: 'var(--sans)',
-              background: 'var(--green)',
-              color: '#050f0a',
-              border: 'none',
-              borderRadius: '10px',
-              cursor: 'pointer',
-              letterSpacing: '0.02em',
-              marginBottom: '10px',
-            }}
-            onClick={startGame}
-          >
-            Start game
-          </button>
-          <button
-            style={{
-              width: '100%',
-              padding: '13px',
-              fontSize: '15px',
-              fontWeight: 500,
-              fontFamily: 'var(--sans)',
-              background: 'transparent',
-              color: 'var(--muted)',
-              border: '1px solid var(--border-strong)',
-              borderRadius: '10px',
-              cursor: 'pointer',
-            }}
-            onClick={startGameAnon}
-          >
-            Play without a name
-          </button>
-        </div>
-      )}
-
-      {/* PLAY SCREEN */}
-      {(phase === 'showing' || phase === 'input') && (
-        <div style={{ textAlign: 'center', width: '100%' }}>
+          {dailyBanner}
+          {progressionBar}
           <div
             style={{
               display: 'flex',
@@ -515,25 +737,28 @@ export const App = () => {
               ))}
             </div>
             <button
+              className="btn btn-quit"
               onClick={quitGame}
               title="Quit game"
-              style={{
-                fontSize: '12px',
-                fontFamily: 'var(--sans)',
-                fontWeight: 500,
-                color: 'var(--muted)',
-                background: 'transparent',
-                border: '1px solid var(--border)',
-                borderRadius: '6px',
-                padding: '5px 10px',
-                cursor: 'pointer',
-              }}
+              style={{ fontSize: '12px', padding: '6px 12px' }}
             >
               ✕ Quit
             </button>
           </div>
 
+          {showWrongBanner && (
+            <div className="wrong-banner">
+              <span style={{ fontSize: '18px' }}>✗</span>
+              <span>
+                {feedbackType === 'bad' && feedback.includes("Time")
+                  ? `⏱ Time's up! The number was ${currentNumber}`
+                  : `Wrong! The number was ${currentNumber}`}
+              </span>
+            </div>
+          )}
+
           <div
+            className={shakeCard ? 'shake' : ''}
             style={{
               background: 'var(--surface)',
               border: `1px solid ${cardState === 'correct' ? 'rgba(0,229,160,0.4)' : cardState === 'wrong' ? 'rgba(255,78,106,0.4)' : 'var(--border)'}`,
@@ -555,16 +780,44 @@ export const App = () => {
             <div
               style={{
                 fontFamily: 'var(--mono)',
-                fontSize: '48px',
-                letterSpacing: '0.18em',
+                fontSize: numberFontSize(currentNumber.length),
+                letterSpacing: currentNumber.length <= 5 ? '0.18em' : '0.1em',
                 color: 'var(--text)',
                 opacity: showNumber ? 1 : 0,
                 transition: 'opacity 0.25s',
+                wordBreak: 'break-all',
+                lineHeight: 1.3,
               }}
             >
-              {showNumber ? currentNumber : ''}
+              {showNumber ? formatNumber(currentNumber) : ''}
             </div>
           </div>
+
+          {/* ── CORRECT BANNER ── */}
+          {showCorrectBanner && (
+            <div
+              style={{
+                animation: 'correctPop 0.35s ease-out forwards',
+                background: 'var(--green-dim)',
+                border: '1px solid rgba(16,185,129,0.45)',
+                borderRadius: '12px',
+                padding: '14px 20px',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                gap: '10px',
+                color: 'var(--green)',
+                fontSize: '17px',
+                fontWeight: 700,
+                marginTop: '8px',
+              }}
+            >
+              <span style={{ fontSize: '22px' }}>🎉</span>
+              <span>
+                {level <= 4 ? 'Nice one!' : level <= 7 ? 'Great job!' : level <= 10 ? 'Impressive!' : 'Incredible! 🔥'}
+              </span>
+            </div>
+          )}
 
           <div
             style={{
@@ -609,7 +862,6 @@ export const App = () => {
                   value={userInput}
                   onChange={(e) => {
                     const val = e.target.value;
-                    // Only allow numeric input
                     if (val === '' || /^\d+$/.test(val)) {
                       setUserInput(val);
                       setInputError(false);
@@ -623,9 +875,7 @@ export const App = () => {
                       setFeedbackType('bad');
                     }
                   }}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter') checkAnswer();
-                  }}
+                  onKeyDown={(e) => { if (e.key === 'Enter') checkAnswer(); }}
                   autoFocus
                   style={{
                     width: '100%',
@@ -643,10 +893,10 @@ export const App = () => {
                   }}
                 />
                 <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-                  <div 
-                    style={{ 
-                      display: 'flex', 
-                      alignItems: 'center', 
+                  <div
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
                       gap: '8px',
                       padding: '8px 12px',
                       background: 'var(--surface)',
@@ -656,14 +906,7 @@ export const App = () => {
                     }}
                   >
                     <svg width="20" height="20" viewBox="0 0 20 20" style={{ transform: 'rotate(-90deg)' }}>
-                      <circle
-                        cx="10"
-                        cy="10"
-                        r="8"
-                        fill="none"
-                        stroke="var(--surface2)"
-                        strokeWidth="2"
-                      />
+                      <circle cx="10" cy="10" r="8" fill="none" stroke="var(--surface2)" strokeWidth="2" />
                       <circle
                         cx="10"
                         cy="10"
@@ -673,7 +916,7 @@ export const App = () => {
                         strokeWidth="2"
                         strokeLinecap="round"
                         strokeDasharray="50.27"
-                        strokeDashoffset={50.27 * (1 - timeLeft / INPUT_TIME)}
+                        strokeDashoffset={50.27 * (1 - timeLeft / maxTime)}
                         style={{ transition: 'stroke 0.5s' }}
                       />
                     </svg>
@@ -691,22 +934,10 @@ export const App = () => {
                     </span>
                   </div>
                   <button
+                    className="btn btn-primary"
                     onClick={checkAnswer}
                     disabled={!userInput.trim()}
-                    style={{
-                      flex: 1,
-                      padding: '14px 20px',
-                      fontSize: '16px',
-                      fontWeight: 600,
-                      fontFamily: 'var(--sans)',
-                      background: userInput.trim() ? 'var(--green)' : 'var(--surface2)',
-                      color: userInput.trim() ? '#050f0a' : 'var(--muted)',
-                      border: 'none',
-                      borderRadius: '10px',
-                      cursor: userInput.trim() ? 'pointer' : 'not-allowed',
-                      transition: 'all 0.2s',
-                      opacity: userInput.trim() ? 1 : 0.5,
-                    }}
+                    style={{ flex: 1, padding: '16px 20px', fontSize: '16px' }}
                   >
                     Submit
                   </button>
@@ -727,67 +958,103 @@ export const App = () => {
         </div>
       )}
 
-      {/* RESULT SCREEN */}
-      {phase === 'result' && (
+      {/* ── GAME OVER SCREEN ── */}
+      {phase === 'gameover' && (
         <div style={{ textAlign: 'center', width: '100%' }}>
           <div style={{ fontSize: '48px', marginBottom: '1rem' }}>{emoji}</div>
           <div
             style={{
               fontSize: '72px',
-              fontWeight: 600,
+              fontWeight: 700,
               color: 'var(--green)',
               fontFamily: 'var(--mono)',
               lineHeight: 1,
             }}
           >
-            {digits}
+            {levelsCompleted}
           </div>
           <div style={{ fontSize: '15px', color: 'var(--muted)', margin: '6px 0 4px' }}>
-            digits remembered
+            {levelsCompleted === 1 ? 'level completed' : 'levels completed'}
           </div>
-          <div style={{ fontSize: '18px', fontWeight: 600, marginBottom: '20px' }}>
-            {playerName ? `Well done, ${playerName}!` : 'Well done!'}
+          <div style={{ fontSize: '18px', fontWeight: 600, marginBottom: '24px' }}>
+            Well done!
           </div>
+
+          {/* Milestone strip */}
           <div
             style={{
               display: 'flex',
-              gap: '4px',
-              alignItems: 'flex-end',
-              justifyContent: 'center',
-              margin: '1.5rem 0',
-              height: '48px',
+              alignItems: 'center',
+              gap: '0',
+              marginBottom: '1.5rem',
+              padding: '0 4px',
             }}
           >
-            {benchmarks.map((b) => {
-              const h = Math.round((b.val / maxBench) * 44);
+            {MILESTONES.map((m, i) => {
+              const reached = levelsCompleted >= m;
+              const isNext = !reached && (i === 0 || levelsCompleted >= (MILESTONES[i - 1] ?? 0));
               return (
                 <div
-                  key={b.label}
+                  key={m}
                   style={{
                     display: 'flex',
-                    flexDirection: 'column',
                     alignItems: 'center',
-                    gap: '4px',
+                    flex: i < MILESTONES.length - 1 ? 1 : 'none',
                   }}
                 >
                   <div
                     style={{
-                      width: '28px',
-                      height: `${h}px`,
-                      borderRadius: '4px 4px 0 0',
-                      background: b.color,
-                      opacity: 0.85,
+                      display: 'flex',
+                      flexDirection: 'column',
+                      alignItems: 'center',
+                      gap: '4px',
+                      flexShrink: 0,
                     }}
-                  />
-                  <div style={{ fontSize: '10px', color: 'var(--muted)' }}>
-                    {b.label}
-                    <br />
-                    <strong style={{ color: 'var(--text)' }}>{b.val}</strong>
+                  >
+                    <div
+                      style={{
+                        width: isNext ? '20px' : '14px',
+                        height: isNext ? '20px' : '14px',
+                        borderRadius: '50%',
+                        background: reached ? 'var(--green)' : isNext ? 'transparent' : 'var(--surface2)',
+                        border: isNext ? '2px dashed var(--green)' : reached ? 'none' : '1px solid var(--border)',
+                        boxShadow: reached ? '0 0 6px var(--green)' : 'none',
+                        transition: 'all 0.3s',
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                      }}
+                    >
+                      {reached && <span style={{ fontSize: '8px', color: '#000', fontWeight: 900 }}>✓</span>}
+                    </div>
+                    <div
+                      style={{
+                        fontSize: '10px',
+                        color: reached ? 'var(--green)' : isNext ? 'var(--text)' : 'var(--muted)',
+                        fontWeight: reached || isNext ? 600 : 400,
+                        minWidth: '16px',
+                        textAlign: 'center',
+                      }}
+                    >
+                      {m}
+                    </div>
                   </div>
+                  {i < MILESTONES.length - 1 && (
+                    <div
+                      style={{
+                        height: '2px',
+                        flex: 1,
+                        background: levelsCompleted > m ? 'var(--green)' : 'var(--surface2)',
+                        marginBottom: '14px',
+                        transition: 'background 0.3s',
+                      }}
+                    />
+                  )}
                 </div>
               );
             })}
           </div>
+
           <div
             style={{
               display: 'inline-block',
@@ -797,52 +1064,61 @@ export const App = () => {
               padding: '8px 16px',
               fontSize: '13px',
               color: 'var(--muted)',
-              marginBottom: '1.5rem',
+              marginBottom: '1rem',
             }}
           >
             {tag}
           </div>
+
+          {submitResult && (
+            <div style={{ background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: '12px', padding: '14px', marginBottom: '1rem', textAlign: 'left' }}>
+              <div style={{ fontSize: '13px', color: 'var(--green)', fontWeight: 600, marginBottom: '8px' }}>
+                +{submitResult.xpEarned} XP earned
+                {submitResult.isPersonalBest && ' · New personal best!'}
+              </div>
+              <div style={{ display: 'flex', gap: '16px', fontSize: '12px', color: 'var(--muted)' }}>
+                <span>Level {submitResult.level}</span>
+                {submitResult.streak.current > 0 && <span>🔥 {submitResult.streak.current} day streak</span>}
+                {submitResult.rank !== null && <span>Rank #{submitResult.rank} today</span>}
+              </div>
+            </div>
+          )}
+
+          {leaderboard.length > 0 && (
+            <div style={{ background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: '12px', padding: '12px', marginBottom: '1rem', textAlign: 'left' }}>
+              <div style={{ fontSize: '12px', color: 'var(--muted)', marginBottom: '8px', fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.06em' }}>
+                Today's leaderboard
+              </div>
+              {leaderboard.slice(0, 5).map((entry) => (
+                <div key={entry.rank} style={{ display: 'flex', justifyContent: 'space-between', padding: '6px 0', fontSize: '13px', borderBottom: '1px solid var(--border)' }}>
+                  <span>
+                    {entry.rank <= 3 ? ['🥇', '🥈', '🥉'][entry.rank - 1] : `#${entry.rank}`} {entry.username}
+                  </span>
+                  <span style={{ fontFamily: 'var(--mono)', color: 'var(--green)' }}>{entry.score}</span>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {gameInit && gameInit.personalBest > levelsCompleted && (
+            <div style={{ fontSize: '12px', color: 'var(--muted)', marginBottom: '1rem' }}>
+              Personal best: {gameInit.personalBest} levels
+            </div>
+          )}
+
           <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
             <button
-              style={{
-                width: '100%',
-                padding: '14px',
-                fontSize: '15px',
-                fontWeight: 600,
-                fontFamily: 'var(--sans)',
-                background: 'var(--green)',
-                color: '#050f0a',
-                border: 'none',
-                borderRadius: '10px',
-                cursor: 'pointer',
-                letterSpacing: '0.02em',
-              }}
+              className="btn btn-primary"
+              style={{ width: '100%', padding: '16px', fontSize: '16px', letterSpacing: '0.02em' }}
               onClick={restartGame}
             >
               Play again
-            </button>
-            <button
-              style={{
-                width: '100%',
-                padding: '13px',
-                fontSize: '15px',
-                fontWeight: 500,
-                fontFamily: 'var(--sans)',
-                background: 'transparent',
-                color: 'var(--muted)',
-                border: '1px solid var(--border-strong)',
-                borderRadius: '10px',
-                cursor: 'pointer',
-              }}
-              onClick={() => setPhase('howto')}
-            >
-              How to play
             </button>
           </div>
         </div>
       )}
 
-      {/* QUIT MODAL */}
+      {/* ── QUIT MODAL ── */}
       {showQuitModal && (
         <div
           style={{
@@ -867,9 +1143,7 @@ export const App = () => {
             }}
           >
             <div style={{ fontSize: '32px', marginBottom: '12px' }}>🚪</div>
-            <div style={{ fontSize: '18px', fontWeight: 600, marginBottom: '8px' }}>
-              Quit game?
-            </div>
+            <div style={{ fontSize: '18px', fontWeight: 600, marginBottom: '8px' }}>Quit game?</div>
             <div
               style={{
                 fontSize: '14px',
@@ -882,36 +1156,15 @@ export const App = () => {
             </div>
             <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
               <button
-                style={{
-                  width: '100%',
-                  padding: '14px',
-                  fontSize: '15px',
-                  fontWeight: 600,
-                  fontFamily: 'var(--sans)',
-                  background: 'var(--red)',
-                  color: '#fff',
-                  border: 'none',
-                  borderRadius: '10px',
-                  cursor: 'pointer',
-                  letterSpacing: '0.02em',
-                }}
+                className="btn btn-danger"
+                style={{ width: '100%', padding: '16px', fontSize: '16px', letterSpacing: '0.02em' }}
                 onClick={confirmQuit}
               >
                 Yes, quit
               </button>
               <button
-                style={{
-                  width: '100%',
-                  padding: '13px',
-                  fontSize: '15px',
-                  fontWeight: 500,
-                  fontFamily: 'var(--sans)',
-                  background: 'transparent',
-                  color: 'var(--muted)',
-                  border: '1px solid var(--border-strong)',
-                  borderRadius: '10px',
-                  cursor: 'pointer',
-                }}
+                className="btn btn-secondary"
+                style={{ width: '100%', padding: '16px', fontSize: '16px' }}
                 onClick={closeQuitModal}
               >
                 Keep playing

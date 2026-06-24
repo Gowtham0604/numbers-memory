@@ -5,4 +5,7 @@ import { devvit } from '@devvit/start/vite';
 
 export default defineConfig({
   plugins: [react(), tailwind(), devvit()],
+  build: {
+    sourcemap: false,
+  },
 });

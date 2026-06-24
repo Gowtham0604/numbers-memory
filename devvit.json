@@ -27,6 +27,13 @@
         "endpoint": "/internal/menu/post-create"
       },
       {
+        "label": "Create daily challenge",
+        "description": "Post today's daily challenge",
+        "location": "subreddit",
+        "forUserType": "moderator",
+        "endpoint": "/internal/menu/daily-challenge-create"
+      },
+      {
         "label": "Example form",
         "description": "Show a simple form",
         "location": "subreddit",
@@ -40,6 +47,18 @@
   },
   "triggers": {
     "onAppInstall": "/internal/triggers/on-app-install"
+  },
+  "scheduler": {
+    "tasks": {
+      "daily-challenge": {
+        "endpoint": "/internal/cron/daily-challenge",
+        "cron": "0 0 * * *"
+      },
+      "weekly-recap": {
+        "endpoint": "/internal/cron/weekly-recap",
+        "cron": "0 20 * * 0"
+      }
+    }
   },
   "scripts": {
     "dev": "vite build --watch",
